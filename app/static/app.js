@@ -134,9 +134,17 @@ function renderGapReview(p) {
 //   参数重算 / 采纳 / 撤销改变了生效轴后，旧结论立即作废、不得继续显示；
 //   已选稿仍在文件输入中时自动用同一稿件按新生效轴重新核验，否则提示重传。
 //   生效轴未变（如仅调 CPS 上限、相同参数重提）或修改失败时，结论保留。
-// - 每次上传取递增序号 verifySeq；响应到达时若已有更新的上传、或已切换
-//   项目（project_id 不符），迟到响应直接丢弃——只呈现当前项目最近一次
-//   有效上传的结果。
+// - 响应指纹与本页详情不符时，本页详情可能已过期（另一标签页改轴）：
+//   先拉取该项目最新详情再裁决——响应指纹与最新详情一致，说明已返回的
+//   结论按新详情仍然有效，直接接纳并同步页面；仍不一致（等待期间生效轴
+//   再次变化）才用仍可读取的已选稿按新轴重核。自动重核链有终止条件
+//   （VERIFY_MAX_AUTO_ATTEMPTS）：详情刷新失败、已选稿不可用或达到上限
+//   时立即停止并提示重新上传——不显示旧结论，也不无界发请求。
+// - 每次上传取递增序号 verifySeq；响应或详情到达时若已有更新的上传、或
+//   已切换项目（project_id 不符），迟到结果直接丢弃——只呈现当前项目
+//   最近一次有效上传的结果。
+const VERIFY_MAX_AUTO_ATTEMPTS = 3;  // 一条自动重核链最多发起的核验请求数
+
 function resetDeliveryVerify() {
   state.deliveryVerify = null;
   state.verifyNotice = "";
@@ -167,7 +175,16 @@ function syncDeliveryVerify() {
   }
 }
 
-async function runDeliveryVerify(file, auto) {
+function acceptDeliveryVerify(result) {
+  state.verifyNotice = "";
+  state.deliveryVerify = result;
+  renderDeliveryVerify();
+  const s = result.summary;
+  toast(`核验完成：通过 ${s.pass} · 时间不符 ${s.time_mismatch} · ` +
+        `缺失 ${s.missing} · 新增 ${s.new} · 待确认 ${s.pending}`);
+}
+
+async function runDeliveryVerify(file, auto, attempt = 0) {
   const p = state.project;
   if (!p || !file) return;
   const seq = ++state.verifySeq;
@@ -180,16 +197,12 @@ async function runDeliveryVerify(file, auto) {
     if (seq !== state.verifySeq) return;                     // 已有更新的上传
     if (!state.project || state.project.id !== p.id) return; // 已切换项目
     if (result.project_id !== p.id) return;                  // 防御
-    state.verifyNotice = "";
-    state.deliveryVerify = result;
-    // 等待响应期间生效轴可能又变化（另一标签页改参数/采纳）：到达即过期的
-    // 结果不展示，按最新生效轴重新同步（作废或再次自动重核）
-    syncDeliveryVerify();
-    renderDeliveryVerify();
-    if (state.deliveryVerify !== result) return;             // 到达即过期
-    const s = result.summary;
-    toast(`核验完成：通过 ${s.pass} · 时间不符 ${s.time_mismatch} · ` +
-          `缺失 ${s.missing} · 新增 ${s.new} · 待确认 ${s.pending}`);
+    if (result.timeline_hash === state.project.timeline_hash) {
+      acceptDeliveryVerify(result);        // 指纹相符：结论对当前生效轴有效
+      return;
+    }
+    // 指纹不符：本页详情可能已过期（另一标签页改轴），先取最新详情再裁决
+    await reconcileDeliveryVerify(result, seq, attempt);
   } catch (e) {
     if (seq !== state.verifySeq) return;
     if (!state.project || state.project.id !== p.id) return;
@@ -201,6 +214,56 @@ async function runDeliveryVerify(file, auto) {
     }
     toast(e.message, true);
   }
+}
+
+// 核验响应指纹与本页详情不符：本页详情可能已过期（另一标签页改参数/采纳），
+// 先拉取该项目最新详情再裁决——
+// - 响应指纹与最新详情一致：已返回的结论按新详情仍然有效，接纳并同步页面；
+// - 仍不一致：生效轴在等待期间再次变化，用仍可读取的已选稿按新轴重核。
+// 终止条件：自动重核链达到 VERIFY_MAX_AUTO_ATTEMPTS 次、详情刷新失败或
+// 已选稿不可用时立即停止，作废旧结论并提示重新上传，不无界发请求。
+async function reconcileDeliveryVerify(result, seq, attempt) {
+  const pid = result.project_id;
+  let fresh;
+  try {
+    fresh = await api(`/api/projects/${pid}`);
+  } catch (e) {
+    if (seq !== state.verifySeq) return;
+    if (!state.project || state.project.id !== pid) return;
+    // 详情刷新失败：无法裁决结论是否还有效，作废旧结论并停止
+    state.deliveryVerify = null;
+    state.verifyNotice =
+      `项目详情刷新失败：${e.message}，核验结论已作废，请重新上传回传稿。`;
+    renderDeliveryVerify();
+    toast(e.message, true);
+    return;
+  }
+  if (seq !== state.verifySeq) return;                     // 已有更新的上传
+  if (!state.project || state.project.id !== pid) return;  // 已切换项目
+  state.project = fresh;          // 页面详情同步到最新（另一标签页的改动）
+  if (result.timeline_hash === fresh.timeline_hash) {
+    acceptDeliveryVerify(result);   // 结论按新详情可接纳：无需重核
+    render();
+    loadProjects();
+    return;
+  }
+  // 生效轴在等待期间又变化：已返回的结论不可接纳，需按最新生效轴重核
+  state.deliveryVerify = null;
+  const file = $("#deliveryVerifyForm").delivery.files[0];
+  if (!file) {
+    state.verifyNotice = "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。";
+    render();
+    return;
+  }
+  if (attempt + 1 >= VERIFY_MAX_AUTO_ATTEMPTS) {
+    state.verifyNotice =
+      "生效时间轴多次变化，自动重新核验已停止，请重新上传回传稿。";
+    render();
+    return;
+  }
+  state.verifyNotice = "生效时间轴已变化，正在用已选稿重新核验…";
+  render();
+  await runDeliveryVerify(file, true, attempt + 1);
 }
 
 function renderDeliveryVerify() {
