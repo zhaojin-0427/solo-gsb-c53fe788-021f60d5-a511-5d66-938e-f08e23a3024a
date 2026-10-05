@@ -7,9 +7,18 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const state = {
   project: null,
   deliveryVerify: null,  // 当前展示的核验结果（绑定 project_id + timeline_hash）
-  verifySeq: 0,          // 单调递增的上传序号：使迟到的旧响应失效
-  verifyNotice: "",      // 无结果时核验区显示的提示（已作废 / 重新核验中）
+  verifySeq: 0,          // 单调递增的链路序号：使迟到的旧响应/刷新失效
+  verifyFile: null,      // 最近一次上传稿快照：变轴后据此重核（不依赖文件输入框）
+  verifyRunning: false,  // 串行核验链路是否进行中（任一时刻至多一个在途 POST）
+  verifyRefetch: false,  // 链路进行中又发现变轴：当前 POST 收尾后补一轮重核
+  verifyAutoRounds: 0,   // 本次上传后已自动重核的轮数（有上限，见下）
+  verifyNotice: "",      // 无结果时核验区提示（裁决中 / 已作废 / 已停止）
 };
+
+// 自动重核轮数上限：另一标签页连续变轴时，「核验 → 取最新详情裁决 → 重核」
+// 链路在固定请求数内必然终止；触顶即停止并提示重新上传——不显示旧结论，
+// 也不会无界发请求。手动再次上传会重新计数。
+const MAX_AUTO_REVERIFY = 2;
 
 const VERIFY_LABEL = {
   pass: "通过",
@@ -132,19 +141,32 @@ function renderGapReview(p) {
 // 核验结论与「项目 + 生效时间轴 + 上传先后」绑定：
 // - 服务端在项目详情与核验响应中返回同一 timeline_hash（生效轴指纹）；
 //   参数重算 / 采纳 / 撤销改变了生效轴后，旧结论立即作废、不得继续显示；
-//   已选稿仍在文件输入中时自动用同一稿件按新生效轴重新核验，否则提示重传。
-//   生效轴未变（如仅调 CPS 上限、相同参数重提）或修改失败时，结论保留。
-// - 每次上传取递增序号 verifySeq；响应到达时若已有更新的上传、或已切换
-//   项目（project_id 不符），迟到响应直接丢弃——只呈现当前项目最近一次
+//   最近一次上传稿快照仍在时自动用同一稿件按新生效轴重新核验，否则提示重传。
+//   生效轴未变（如仅调 CPS 上限、相同参数重提）或本页修改失败时，结论保留。
+// - 指纹不符先裁决后重核：响应指纹与本页详情不符时（典型场景：另一标签页
+//   改了最小间隔而本页详情仍旧），先 GET 该项目最新详情——响应指纹与最新
+//   生效轴一致则直接接纳结论；确实落后于最新轴时，再用最近一次上传稿重核。
+//   这样即便本页详情长期未刷新，也不会把每个新响应都误判过期而循环重核。
+// - 终止条件：自动重核最多 MAX_AUTO_REVERIFY 轮；多次连续变轴触顶、详情
+//   刷新失败或上传稿不可用时立即停止并提示重传，不显示旧结论、不无界请求。
+// - 每次上传取递增序号 verifySeq；响应/刷新到达时若已有更新的上传、或已
+//   切换项目（project_id 不符），迟到结果直接丢弃——只呈现当前项目最近一次
 //   有效上传的结果。
 function resetDeliveryVerify() {
   state.deliveryVerify = null;
+  state.verifyFile = null;
+  state.verifyRunning = false;
+  state.verifyRefetch = false;
+  state.verifyAutoRounds = 0;
   state.verifyNotice = "";
-  state.verifySeq++;                 // 使在途的旧响应全部失效
+  state.verifySeq++;                 // 使在途的旧链路全部失效
   const f = $("#deliveryVerifyForm");
   if (f) f.reset();
 }
 
+// 本地 render() 时的同步：state.project 来自本页刚完成的写操作或历史项目，
+// 先与本页指纹比对（命中则零请求保留）。跨标签页的陈旧详情不由这里兜底，
+// 由响应到达后的裁决取最新详情处理，避免无据空转。
 function syncDeliveryVerify() {
   const p = state.project;
   const v = state.deliveryVerify;
@@ -156,51 +178,181 @@ function syncDeliveryVerify() {
     return;
   }
   if (v.timeline_hash === p.timeline_hash) return;   // 生效轴未变：保留
-  // 生效轴已变化：旧结论立即作废，不再显示
+  // 生效轴已随本页操作变化：旧结论立即作废，安排一次按最新轴的重核
+  requestVerifyRefetch("生效时间轴已变化，正在用最近一次上传稿重新核验…");
+}
+
+// 链路已被更新的上传 / 切换项目 / 删除项目 / 终止动作取代
+function isVerifyStale(seq, pid) {
+  return seq !== state.verifySeq ||
+    !state.project || state.project.id !== pid;
+}
+
+// 发现生效轴已变，要求链路再核验一轮。稿件不可读或超出自动重核轮数上限时
+// 立即终止；链路在途时只置 verifyRefetch，由当前 POST 收尾后串行补发——
+// 同一时刻至多一个在途 POST，绝不并发重复请求。
+function requestVerifyRefetch(notice) {
   state.deliveryVerify = null;
-  const file = $("#deliveryVerifyForm").delivery.files[0];
-  if (file) {
-    state.verifyNotice = "生效时间轴已变化，正在用已选稿重新核验…";
-    runDeliveryVerify(file, true);
-  } else {
-    state.verifyNotice = "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。";
+  if (!state.verifyFile) {
+    stopVerify("生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。");
+    return;
+  }
+  if (state.verifyAutoRounds >= MAX_AUTO_REVERIFY) {
+    stopVerify("生效时间轴已多次变化且自动重核仍未收敛，已停止；" +
+               "请重新上传回传稿后再核验。");
+    return;
+  }
+  state.verifyNotice = notice;
+  if (state.verifyRunning) {
+    // 串行链路在途：POST 之后的「取最新详情 → 接纳 / 重核」由链路循环
+    // 自行裁决；这里挂起标记仅覆盖「等待 POST 期间」的本地变轴，循环每轮
+    // 开始裁决前复位该标记（见 runVerifyChain），避免与循环各发一次。
+    state.verifyRefetch = true;
+    return;
+  }
+  state.verifyAutoRounds++;
+  runVerifyChain(state.project.id, state.verifyFile, true, state.verifySeq);
+}
+
+// 终止核验链路：不显示旧结论；推进序号使所有在途 POST / 详情刷新失效。
+function stopVerify(notice) {
+  state.verifySeq++;
+  state.verifyRunning = false;
+  state.verifyRefetch = false;
+  state.deliveryVerify = null;
+  state.verifyNotice = notice;
+  renderDeliveryVerify();
+}
+
+// 串行核验链路：POST 一轮 → 指纹不符则取最新详情裁决 → 确属过期再按轮数
+// 上限串行重核。任一时刻至多一个在途 POST，故另一标签页连续变轴时请求
+// 总数有界（≤ MAX_AUTO_REVERIFY+1 个 POST 与等量详情 GET），不会循环。
+async function runVerifyChain(pid, file, auto, seq) {
+  state.verifyRunning = true;
+  let settled = false;   // 已接纳 / 已终止：finally 不得再因挂起标记补发
+  try {
+    while (true) {
+      if (isVerifyStale(seq, pid)) { settled = true; return; }
+      const fd = new FormData();
+      fd.append("delivery", file);
+      let result;
+      try {
+        result = await api(`/api/projects/${pid}/verify-delivery`,
+                           { method: "POST", body: fd });
+      } catch (e) {
+        if (isVerifyStale(seq, pid)) return;
+        if (auto) {
+          // 自动重核失败（解析失败 / 文件不可用 / 服务错误）：作废旧结论，
+          // 有界终止并要求人工重传——不保留旧结论、不再自行重试
+          settled = true;
+          stopVerify(`自动重新核验失败：${e.message}，请重新上传回传稿。`);
+        } else {
+          state.verifyRunning = false;   // 手动失败：已有有效结论保持原样
+          toast(e.message, true);
+          settled = true;
+        }
+        return;
+      }
+      if (isVerifyStale(seq, pid) || result.project_id !== pid) {
+        settled = true;
+        return;
+      }
+
+      // 进入本轮裁决：是否需要再核验由下方「最新详情比对」决定。等待 POST
+      // 期间 render 可能挂起的重核标记在此复位，避免与裁决各发一次。
+      state.verifyRefetch = false;
+
+      // 与本页详情一致（本页改轴或本页详情本就最新）：直接接纳，零额外请求
+      if (result.timeline_hash === state.project.timeline_hash) {
+        settled = true;
+        acceptDeliveryResult(result);
+        return;
+      }
+      // 指纹不符：典型为另一标签页改了最小间隔而本页详情仍旧。裁决期间
+      // 也不显示可能过期的行——先 GET 该项目最新详情，再决定接纳 / 重核。
+      state.deliveryVerify = null;
+      state.verifyNotice = "生效时间轴指纹与本页不一致，正在获取项目最新详情裁决…";
+      renderDeliveryVerify();
+      let latest;
+      try {
+        latest = await api(`/api/projects/${pid}`);
+      } catch (e) {
+        if (isVerifyStale(seq, pid)) { settled = true; return; }
+        // 刷新失败：停止并提示重传，不用旧结论兜底，也不继续重核
+        settled = true;
+        stopVerify(`无法获取项目最新详情（${e.message}），已停止自动核验；` +
+                   `请检查后重新上传回传稿。`);
+        toast(e.message, true);
+        return;
+      }
+      if (isVerifyStale(seq, pid)) { settled = true; return; }
+      state.project = latest;
+      if (result.timeline_hash === latest.timeline_hash) {
+        // 结论按【最新详情】可以接纳（变轴发生在本页详情刷新之前，响应
+        // 本就基于最新轴算出）：不重核，直接呈现并把本页详情同步到最新
+        settled = true;
+        acceptDeliveryResult(result);
+        render();
+        return;
+      }
+      // 结论确实落后于最新生效轴：用最近一次仍可读取的上传稿串行重核，
+      // 受轮数上限约束；触顶或稿件不可用则停止并提示重传，不显示旧结论。
+      if (!state.verifyFile) {
+        settled = true;
+        stopVerify("生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。");
+        return;
+      }
+      if (state.verifyAutoRounds >= MAX_AUTO_REVERIFY) {
+        settled = true;
+        stopVerify("生效时间轴已多次变化且自动重核仍未收敛，已停止；" +
+                   "请重新上传回传稿后再核验。");
+        return;
+      }
+      state.verifyAutoRounds++;
+      auto = true;   // 后续轮次均为自动重核，失败一律走「停止并提示重传」
+      state.verifyNotice = "生效时间轴已在别处变化，正在按最新时间轴重新核验…";
+      // 回到 while 顶部串行发出下一轮 POST（本帧内继续，不另起链路，因此
+      // finally 不会在还有下一轮时补发）。
+    }
+  } finally {
+    // 循环正常接纳 / 失败 / 被取代时才到这里。若等待 POST 或 GET 期间本页
+    // render 又发现一次变轴并挂起 verifyRefetch（裁决循环未覆盖到的本地
+    // 变轴），在同一链路序号内串行补发至多一轮，受稿件可用性与轮数上限
+    // 约束；触顶 / 稿件不可用则终止提示重传。任一时刻不会有第二个在途 POST。
+    if (state.verifySeq === seq) state.verifyRunning = false;
+    if (settled || state.verifySeq !== seq || !state.verifyRefetch ||
+        !state.project || state.project.id !== pid) return;
+    state.verifyRefetch = false;
+    settled = true;
+    if (!state.verifyFile) {
+      stopVerify("生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。");
+    } else if (state.verifyAutoRounds >= MAX_AUTO_REVERIFY) {
+      stopVerify("生效时间轴已多次变化且自动重核仍未收敛，已停止；" +
+                 "请重新上传回传稿后再核验。");
+    } else {
+      settled = false;   // 转交新链路：本帧的终止判定对其不适用
+      state.verifyAutoRounds++;
+      runVerifyChain(pid, state.verifyFile, true, seq);
+    }
   }
 }
 
+function acceptDeliveryResult(result) {
+  state.verifyRefetch = false;
+  state.verifyRunning = false;
+  state.verifyNotice = "";
+  state.deliveryVerify = result;
+  renderDeliveryVerify();
+  const s = result.summary;
+  toast(`核验完成：通过 ${s.pass} · 时间不符 ${s.time_mismatch} · ` +
+        `缺失 ${s.missing} · 新增 ${s.new} · 待确认 ${s.pending}`);
+}
+
+// 提交一次核验（手动/自动入口）：在串行链路内完成裁决与可能的重核
 async function runDeliveryVerify(file, auto) {
   const p = state.project;
   if (!p || !file) return;
-  const seq = ++state.verifySeq;
-  const fd = new FormData();
-  fd.append("delivery", file);
-  try {
-    const result = await api(`/api/projects/${p.id}/verify-delivery`,
-                             { method: "POST", body: fd });
-    // 绑定校验：只呈现当前项目最近一次有效上传的结果
-    if (seq !== state.verifySeq) return;                     // 已有更新的上传
-    if (!state.project || state.project.id !== p.id) return; // 已切换项目
-    if (result.project_id !== p.id) return;                  // 防御
-    state.verifyNotice = "";
-    state.deliveryVerify = result;
-    // 等待响应期间生效轴可能又变化（另一标签页改参数/采纳）：到达即过期的
-    // 结果不展示，按最新生效轴重新同步（作废或再次自动重核）
-    syncDeliveryVerify();
-    renderDeliveryVerify();
-    if (state.deliveryVerify !== result) return;             // 到达即过期
-    const s = result.summary;
-    toast(`核验完成：通过 ${s.pass} · 时间不符 ${s.time_mismatch} · ` +
-          `缺失 ${s.missing} · 新增 ${s.new} · 待确认 ${s.pending}`);
-  } catch (e) {
-    if (seq !== state.verifySeq) return;
-    if (!state.project || state.project.id !== p.id) return;
-    if (auto) {
-      // 自动重核失败：作废旧结论，要求人工重传
-      state.deliveryVerify = null;
-      state.verifyNotice = `自动重新核验失败：${e.message}，请重新上传回传稿。`;
-      renderDeliveryVerify();
-    }
-    toast(e.message, true);
-  }
+  await runVerifyChain(p.id, file, auto, state.verifySeq);
 }
 
 function renderDeliveryVerify() {
@@ -518,14 +670,21 @@ $("#gapList").addEventListener("click", async (ev) => {
 });
 
 // 交付字幕核验：上传回传稿，服务端保序最优对应后返回逐行结论。
-// 只读核验，失败（空稿/解析失败）仅弹错，不影响当前项目数据。
+// 只读核验，失败（空稿/解析失败）仅弹错，不影响当前项目数据与已展示结论。
+// 上传稿留存快照（state.verifyFile）：变轴后自动重核不依赖文件输入框。
 $("#deliveryVerifyForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   if (!state.project) return;
   const file = ev.target.delivery.files[0];
   if (!file) return;
+  state.verifySeq++;                 // 新上传：使在途旧链路全部失效
+  state.verifyFile = file;
+  state.verifyRunning = false;       // 新链路接管
+  state.verifyRefetch = false;
+  state.verifyAutoRounds = 0;        // 新的一次有效上传，自动重核计数归零
   state.verifyNotice = "";
-  await runDeliveryVerify(file, false);
+  renderDeliveryVerify();
+  await runVerifyChain(state.project.id, file, false, state.verifySeq);
 });
 
 $("#deleteProjectBtn").addEventListener("click", async () => {  if (!state.project) return;
